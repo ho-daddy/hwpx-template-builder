@@ -5,6 +5,9 @@ HWPX → 재사용 템플릿 변환 웹앱 (FastAPI 단일 파일)
 - (paraPrIDRef, charPrIDRef, inTable) 키로 스타일 클러스터 자동 생성
 - 휴리스틱으로 역할 이름(제목/본문/목록/표머리글 등) 제안
 - POST /api/template 에서 최종 템플릿 JSON 생성
+- POST /api/label 에서 각 자리에 AI가 내용 기반 한글 이름표를 붙임(1회성 판단)
+- POST /api/templates 로 저장 후, POST /api/templates/{id}/generate 로
+  {라벨: 새값} 딕셔너리만 받아 순수 기계적으로 새 hwpx 생성
 """
 import io
 import re
@@ -13,13 +16,18 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
+
+import ai_label
+import db
+from generate import GenerateError, generate_hwpx
 
 app = FastAPI(title="HWPX Template Builder")
 BASE = Path(__file__).resolve().parent
 STATIC = BASE / "static"
+db.init_db()
 
 # ---------------------------------------------------------------------------
 # 방어적 XML 헬퍼
@@ -149,13 +157,20 @@ class Doc:
         self.tables = {}
         self._table_seq = 0
 
-    def add_para(self, para_pr_ref, char_pr_ref, text, in_table):
+    def add_para(self, para_pr_ref, char_pr_ref, text, in_table,
+                 t_occurrence=None, has_tab=False, section_file=None):
         self.paragraphs.append({
             "index": len(self.paragraphs),
             "text": text,
             "paraPrIDRef": para_pr_ref,
             "charPrIDRef": char_pr_ref,
             "inTable": in_table,
+            # generate 단계(새 hwpx 생성)에서 이 문단의 <hp:t>를 raw XML에서 다시
+            # 찾기 위한 위치정보. tOccurrence는 이 섹션파일 안에서 몇 번째 <hp:t>
+            # 태그인지(런 1개짜리 문단만 유일하게 특정 가능 — 여러 런이면 None).
+            "tOccurrence": t_occurrence,
+            "hasTab": has_tab,
+            "sectionFile": section_file,
         })
         return len(self.paragraphs) - 1
 
@@ -175,27 +190,47 @@ def t_element_text(t_el):
     return "".join(parts)
 
 
-def para_text_and_runs(p_el):
+def has_tab_child(t_el):
+    return any(localname(c.tag) == "tab" for c in t_el)
+
+
+def para_text_and_runs(p_el, counter):
     """문단 내 run 텍스트를 모으고 charPrIDRef별 글자 수를 세어 대표 run을 정한다.
     HWPX는 run 자체가 아니라 run의 자식 <hp:t>에 텍스트를 담으므로 그쪽에서 읽는다.
     p_el의 직계 run 자식만 본다(iter() 전체탐색 X) — 문단 안에 표가 중첩된 경우
-    표 셀 내부의 run까지 딸려와 문단 텍스트에 섞이는 것을 방지한다."""
+    표 셀 내부의 run까지 딸려와 문단 텍스트에 섞이는 것을 방지한다.
+
+    counter: [int] 형태의 공유 카운터 — 이 섹션파일 안에서 만난 모든 <hp:t>
+    태그(자기닫힘 포함) 순서를 0부터 셈. ElementTree 순회는 raw XML의 좌→우
+    등장 순서와 항상 일치하므로, 이 번호가 나중에 generate 단계에서 raw 문자열을
+    regex로 다시 스캔했을 때의 occurrence 인덱스와 정확히 대응한다.
+    문단이 <hp:t>를 정확히 1개만 가질 때만(런 1개) 유일하게 특정 가능해 tOccurrence를
+    반환하고, 0개/2개 이상이면 None(치환 대상에서 제외 — 다음 개발 범위)."""
     parts, run_counts = [], {}
+    occurrences = []
     for el in p_el:
         if localname(el.tag) != "run":
             continue
         t_el = child_any(el, ["t"])
-        t = t_element_text(t_el) if t_el is not None else ""
+        if t_el is None:
+            continue
+        occurrences.append((counter[0], has_tab_child(t_el)))
+        counter[0] += 1
+        t = t_element_text(t_el)
         if not t:
             continue
         parts.append(t)
         ref = attr_any(el, ["charPrIDRef", "charPrRef", "charPrId"])
         ref = ref if ref is not None else "0"
         run_counts[ref] = run_counts.get(ref, 0) + len(t)
-    return "".join(parts), run_counts
+    if len(occurrences) == 1:
+        t_occurrence, has_tab = occurrences[0]
+    else:
+        t_occurrence, has_tab = None, False
+    return "".join(parts), run_counts, t_occurrence, has_tab
 
 
-def extract_table(tbl_el, doc, record=True):
+def extract_table(tbl_el, doc, record=True, counter=None, section_file=None):
     rows = []
     for tr in tbl_el:
         if localname(tr.tag) != "tr":
@@ -211,11 +246,11 @@ def extract_table(tbl_el, doc, record=True):
             for el in tc.iter():
                 if localname(el.tag) != "p":
                     continue
-                text, runs = para_text_and_runs(el)
+                text, runs, t_occ, has_tab = para_text_and_runs(el, counter)
                 dom = max(runs, key=runs.get) if runs else "0"
                 idx = doc.add_para(
                     attr_any(el, ["paraPrIDRef", "paraPrRef", "paraPrId"]),
-                    dom, text, True,
+                    dom, text, True, t_occ, has_tab, section_file,
                 )
                 # 셀 대표 문단 = 텍스트가 가장 긴 문단 (나머지 문단도 클러스터링에는 포함)
                 if len(text) > best_len:
@@ -231,15 +266,15 @@ def extract_table(tbl_el, doc, record=True):
     return block
 
 
-def walk(el, in_table, doc):
+def walk(el, in_table, doc, counter, section_file):
     for child in el:
         ln = localname(child.tag)
         if ln == "p":
-            text, runs = para_text_and_runs(child)
+            text, runs, t_occ, has_tab = para_text_and_runs(child, counter)
             dom = max(runs, key=runs.get) if runs else "0"
             idx = doc.add_para(
                 attr_any(child, ["paraPrIDRef", "paraPrRef", "paraPrId"]),
-                dom, text, in_table,
+                dom, text, in_table, t_occ, has_tab, section_file,
             )
             if not in_table:
                 doc.structure.append({"type": "paragraph", "paraIndex": idx})
@@ -249,15 +284,17 @@ def walk(el, in_table, doc):
                     continue
                 for grandchild in run_child:
                     if localname(grandchild.tag) == "tbl":
-                        block = extract_table(grandchild, doc, record=not in_table)
+                        block = extract_table(grandchild, doc, record=not in_table,
+                                               counter=counter, section_file=section_file)
                         if not in_table:
                             doc.structure.append(block)
         elif ln == "tbl":
-            block = extract_table(child, doc, record=not in_table)
+            block = extract_table(child, doc, record=not in_table,
+                                   counter=counter, section_file=section_file)
             if not in_table:
                 doc.structure.append(block)
         else:
-            walk(child, in_table, doc)
+            walk(child, in_table, doc, counter, section_file)
 
 
 # ---------------------------------------------------------------------------
@@ -388,7 +425,8 @@ def analyze_hwpx(data: bytes, filename: str):
     for n in sec_names:
         root = ET.fromstring(zf.read(n))
         body = next((el for el in root.iter() if localname(el.tag) == "body"), None)
-        walk(body if body is not None else root, False, doc)
+        counter = [0]  # 섹션파일마다 <hp:t> occurrence 번호를 0부터 새로 셈
+        walk(body if body is not None else root, False, doc, counter, n)
     clusters = build_clusters(doc, char_prs, para_prs)
     return {
         "meta": {
@@ -465,10 +503,16 @@ def make_template(payload: dict):
         btype = block.get("type")
         if btype == "paragraph":
             i = block.get("paraIndex")
+            p = pmap.get(i) or {}
             out_structure.append({
                 "type": "paragraph",
                 "style": para_to_cluster.get(i),
-                "text": (pmap.get(i) or {}).get("text", ""),
+                "text": p.get("text", ""),
+                "paraIndex": i,
+                # generate 단계에서 이 자리를 다시 찾기 위한 위치정보 (analyze 단계에서 계산됨)
+                "tOccurrence": p.get("tOccurrence"),
+                "hasTab": p.get("hasTab", False),
+                "sectionFile": p.get("sectionFile"),
             })
         elif btype == "table":
             cells = []
@@ -476,9 +520,14 @@ def make_template(payload: dict):
                 crow = []
                 for cell in row:
                     i = cell.get("paraIndex")
+                    p = (pmap.get(i) or {}) if i is not None else {}
                     crow.append({
                         "style": para_to_cluster.get(i) if i is not None else None,
-                        "text": (pmap.get(i) or {}).get("text", "") if i is not None else "",
+                        "text": p.get("text", "") if i is not None else "",
+                        "paraIndex": i,
+                        "tOccurrence": p.get("tOccurrence") if i is not None else None,
+                        "hasTab": p.get("hasTab", False) if i is not None else False,
+                        "sectionFile": p.get("sectionFile") if i is not None else None,
                         "rowSpan": cell.get("rowSpan", 1),
                         "colSpan": cell.get("colSpan", 1),
                     })
@@ -500,6 +549,93 @@ def make_template(payload: dict):
         "styles": styles,
         "structure": out_structure,
     }
+
+
+@app.post("/api/label")
+def label_template(payload: dict):
+    """template(=/api/template 출력물)의 각 자리에 AI가 내용 기반 한글
+    이름표를 붙여 돌려준다. 이 판단은 템플릿당 1회만 필요 — generate는
+    이 결과를 그대로 저장해뒀다가 기계적으로만 값을 채운다."""
+    structure = payload.get("structure") or []
+    provider = payload.get("provider") or "qwen"
+    api_key = payload.get("apiKey") or ""
+    slots = ai_label.flatten_fillable_slots(structure)
+    try:
+        labels = ai_label.label_slots(slots, provider=provider, api_key=api_key)
+    except Exception as e:
+        raise HTTPException(502, f"AI 라벨링 실패({provider}): {type(e).__name__}: {e}")
+    structure = ai_label.merge_labels_into_structure(structure, labels)
+    return {**payload, "structure": structure, "labelCount": len(labels)}
+
+
+@app.post("/api/templates")
+async def create_template(
+    name: str = Form(...),
+    template: str = Form(...),
+    file: UploadFile = File(...),
+):
+    """라벨 붙은 template(JSON 문자열) + 원본 hwpx 파일을 함께 저장한다.
+    원본 바이트가 있어야 나중에 generate가 라벨 없는 자리는 그대로 두고
+    라벨 있는 자리만 정확히 치환할 수 있다."""
+    import json as _json
+    try:
+        template_obj = _json.loads(template)
+    except _json.JSONDecodeError as e:
+        raise HTTPException(400, f"template이 올바른 JSON이 아닙니다: {e}")
+    data = await file.read()
+    template_id = db.save_template(name, file.filename or "", template_obj, data)
+    return {"id": template_id, "name": name}
+
+
+@app.get("/api/templates")
+def list_templates():
+    return db.list_templates()
+
+
+@app.get("/api/templates/{template_id}")
+def get_template(template_id: int):
+    row = db.get_template(template_id)
+    if row is None:
+        raise HTTPException(404, "템플릿을 찾을 수 없습니다")
+    row.pop("original_hwpx", None)
+    return row
+
+
+@app.delete("/api/templates/{template_id}")
+def remove_template(template_id: int):
+    if not db.delete_template(template_id):
+        raise HTTPException(404, "템플릿을 찾을 수 없습니다")
+    return {"deleted": template_id}
+
+
+@app.post("/api/templates/{template_id}/generate")
+def generate_from_template(template_id: int, payload: dict):
+    """payload: {"values": {"라벨": "새 텍스트", ...}} → 새 hwpx 파일 응답."""
+    row = db.get_template(template_id)
+    if row is None:
+        raise HTTPException(404, "템플릿을 찾을 수 없습니다")
+    values = payload.get("values") or {}
+    try:
+        out_bytes = generate_hwpx(row["original_hwpx"], row["template"], values)
+    except GenerateError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"hwpx 생성 실패: {type(e).__name__}: {e}")
+    # 파일명에 한글이 섞이면 HTTP 헤더가 latin-1 인코딩이라 그대로 못 들어감 —
+    # RFC 5987 filename*=UTF-8''... 형식으로 퍼센트인코딩하고, ascii 폴백도 같이 준다.
+    from urllib.parse import quote
+    filename = f"{row['name']}.hwpx"
+    ascii_fallback = "".join(c if ord(c) < 128 else "_" for c in filename) or "template.hwpx"
+    return Response(
+        content=out_bytes,
+        media_type="application/vnd.hancom.hwpx",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{ascii_fallback}"; '
+                f"filename*=UTF-8''{quote(filename)}"
+            )
+        },
+    )
 
 
 if STATIC.is_dir():
