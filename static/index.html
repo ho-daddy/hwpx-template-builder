@@ -1,0 +1,735 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>HWPX Template Builder</title>
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      background: #f8fafc;
+      color: #111827;
+    }
+
+    header {
+      background: #ffffff;
+      border-bottom: 1px solid #e5e7eb;
+      padding: 16px 24px;
+    }
+
+    header h1 {
+      margin: 0;
+      font-size: 20px;
+      color: #1e3a8a;
+    }
+
+    header p {
+      margin: 6px 0 0;
+      font-size: 13px;
+      color: #6b7280;
+    }
+
+    main {
+      max-width: 1280px;
+      margin: 0 auto;
+      padding: 16px;
+    }
+
+    .card {
+      background: #ffffff;
+      border: 1px solid #e5e7eb;
+      border-radius: 10px;
+      padding: 16px;
+      margin-bottom: 16px;
+    }
+
+    .card h2 {
+      margin: 0 0 12px;
+      font-size: 16px;
+      color: #1f2937;
+    }
+
+    .hidden {
+      display: none;
+    }
+
+    .dropzone {
+      border: 2px dashed #c7d2fe;
+      border-radius: 10px;
+      background: #f5f7ff;
+      padding: 28px;
+      text-align: center;
+      cursor: pointer;
+      transition: background 0.15s ease, border-color 0.15s ease;
+    }
+
+    .dropzone.dragover {
+      background: #eef2ff;
+      border-color: #6366f1;
+    }
+
+    .dropzone .title {
+      font-size: 15px;
+      font-weight: 600;
+      color: #3730a3;
+    }
+
+    .dropzone .sub {
+      margin-top: 6px;
+      font-size: 13px;
+      color: #6b7280;
+    }
+
+    .status {
+      margin-top: 10px;
+      font-size: 13px;
+      color: #374151;
+    }
+
+    .status.error {
+      color: #b91c1c;
+    }
+
+    .status.ok {
+      color: #047857;
+    }
+
+    .meta-bar {
+      background: #f8fafc;
+      border: 1px solid #e2e8f0;
+      border-radius: 8px;
+      padding: 10px 12px;
+      margin-bottom: 16px;
+      font-size: 13px;
+      color: #334155;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 400px 1fr;
+      gap: 16px;
+      align-items: start;
+    }
+
+    @media (max-width: 980px) {
+      .grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    #cluster-list {
+      max-height: 72vh;
+      overflow: auto;
+      padding-right: 4px;
+    }
+
+    .cluster-card {
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      padding: 10px;
+      margin-bottom: 10px;
+      cursor: pointer;
+      background: #ffffff;
+    }
+
+    .cluster-card:hover {
+      border-color: #c7d2fe;
+    }
+
+    .cluster-card.selected {
+      border-color: #6366f1;
+      box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.18);
+    }
+
+    .cluster-card.dim {
+      opacity: 0.55;
+    }
+
+    .cluster-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .cluster-head > div {
+      display: flex;
+      align-items: center;
+      min-width: 0;
+    }
+
+    .badge {
+      display: inline-block;
+      background: #eef2ff;
+      color: #4338ca;
+      border-radius: 999px;
+      padding: 2px 8px;
+      font-size: 12px;
+      font-weight: 600;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 180px;
+    }
+
+    .id {
+      margin-left: 8px;
+      font-size: 12px;
+      color: #6b7280;
+    }
+
+    .count {
+      font-size: 12px;
+      color: #4b5563;
+      white-space: nowrap;
+    }
+
+    .cluster-inputs {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-top: 10px;
+    }
+
+    .cluster-inputs input {
+      width: 100%;
+      border: 1px solid #d1d5db;
+      border-radius: 6px;
+      padding: 6px 8px;
+      font-size: 13px;
+      color: #111827;
+      background: #ffffff;
+    }
+
+    .cluster-inputs input:focus {
+      outline: none;
+      border-color: #6366f1;
+      box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.15);
+    }
+
+    .meta {
+      margin-top: 8px;
+      font-size: 12px;
+      color: #6b7280;
+    }
+
+    .samples {
+      margin-top: 8px;
+    }
+
+    .sample {
+      font-size: 12px;
+      color: #4b5563;
+      margin-top: 4px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .preview {
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      padding: 12px;
+      max-height: 72vh;
+      overflow: auto;
+      background: #ffffff;
+    }
+
+    .para,
+    .cell {
+      margin: 2px 0;
+      padding: 2px 4px;
+      border-radius: 4px;
+      white-space: pre-wrap;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+
+    .para.selected,
+    .cell.selected {
+      outline: 2px solid #4f46e5;
+      background: #c7d2fe !important;
+    }
+
+    .para.dim,
+    .cell.dim {
+      opacity: 0.45;
+    }
+
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      margin: 8px 0 12px;
+    }
+
+    td {
+      border: 1px solid #d1d5db;
+      padding: 4px;
+      vertical-align: top;
+    }
+
+    .actions {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-bottom: 10px;
+    }
+
+    button {
+      border: none;
+      border-radius: 7px;
+      padding: 9px 14px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      background: #4f46e5;
+      color: #ffffff;
+    }
+
+    button:hover {
+      background: #4338ca;
+    }
+
+    button:disabled {
+      background: #cbd5e1;
+      cursor: not-allowed;
+    }
+
+    pre {
+      margin: 10px 0 0;
+      background: #f8fafc;
+      border: 1px solid #e2e8f0;
+      border-radius: 8px;
+      padding: 12px;
+      max-height: 52vh;
+      overflow: auto;
+      font-size: 12px;
+      line-height: 1.5;
+      color: #111827;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>HWPX Template Builder</h1>
+    <p>.hwpx 파일을 업로드하고 스타일 클러스터를 검토한 뒤 재사용 템플릿 JSON을 생성합니다.</p>
+  </header>
+
+  <main>
+    <section id="upload-section" class="card">
+      <h2>1. 업로드</h2>
+      <div id="dropzone" class="dropzone">
+        <div class="title">.hwpx 파일을 드래그하거나 클릭해서 선택하세요</div>
+        <div class="sub">구형 .hwp(OLE2) 파일은 지원하지 않습니다.</div>
+      </div>
+      <input type="file" id="fileInput" accept=".hwpx" hidden>
+      <div id="upload-status" class="status"></div>
+    </section>
+
+    <section id="work-section" class="hidden">
+      <div id="meta-bar" class="meta-bar"></div>
+
+      <div class="grid">
+        <aside id="cluster-panel" class="card">
+          <h2>2. 스타일 클러스터 검토</h2>
+          <div id="cluster-list"></div>
+        </aside>
+
+        <section id="preview-panel" class="card">
+          <h2>3. 원문 미리보기</h2>
+          <div id="preview" class="preview"></div>
+        </section>
+      </div>
+
+      <section id="save-section" class="card">
+        <h2>4. 템플릿 저장</h2>
+        <div class="actions">
+          <button id="saveBtn" type="button">템플릿 확정 및 생성</button>
+          <button id="downloadBtn" type="button" disabled>템플릿.json 다운로드</button>
+        </div>
+        <div id="save-status" class="status"></div>
+        <pre id="template-output" class="hidden"></pre>
+      </section>
+    </section>
+  </main>
+
+  <script>
+    const state = {
+      meta: null,
+      paragraphs: [],
+      clusters: [],
+      structure: [],
+      selectedClusterId: null,
+      template: null,
+      paraToCluster: {},
+      clusterColorIndex: {}
+    };
+
+    const $ = (id) => document.getElementById(id);
+
+    function setStatus(el, message, type) {
+      el.textContent = message;
+      el.className = "status" + (type ? " " + type : "");
+    }
+
+    function clusterColor(clusterId) {
+      if (!state.clusterColorIndex[clusterId]) {
+        state.clusterColorIndex[clusterId] = Object.keys(state.clusterColorIndex).length;
+      }
+      const index = state.clusterColorIndex[clusterId];
+      const hue = (index * 47) % 360;
+      return {
+        bg: "hsl(" + hue + ", 75%, 92%)",
+        strong: "hsl(" + hue + ", 75%, 78%)"
+      };
+    }
+
+    function buildParaToCluster() {
+      state.paraToCluster = {};
+      state.clusters.forEach((c) => {
+        (c.members || []).forEach((i) => {
+          state.paraToCluster[i] = c.id;
+        });
+      });
+    }
+
+    function sampleTexts(cluster, limit) {
+      const out = [];
+      (cluster.members || []).forEach((i) => {
+        const p = state.paragraphs[i];
+        const t = p && p.text ? String(p.text).trim() : "";
+        if (t && out.indexOf(t) === -1) {
+          out.push(t);
+        }
+        if (out.length >= limit) {
+          return;
+        }
+      });
+      return out;
+    }
+
+    function buildClusterMeta(c) {
+      const parts = [];
+      const ch = c.charPr || {};
+      const pa = c.paraPr || {};
+
+      if (ch.heightPt) parts.push(ch.heightPt + "pt");
+      if (ch.bold) parts.push("B");
+      if (ch.italic) parts.push("I");
+      if (ch.underline) parts.push("U");
+      if (ch.font) parts.push(ch.font);
+      if (pa.align) parts.push("align:" + pa.align);
+      if (pa.list) parts.push("list");
+      if (c.inTable) parts.push("table");
+
+      if (!parts.length) return null;
+
+      const div = document.createElement("div");
+      div.className = "meta";
+      div.textContent = parts.join(" · ");
+      return div;
+    }
+
+    function renderMeta() {
+      const m = state.meta || {};
+      const el = $("meta-bar");
+      el.textContent =
+        (m.sourceFile || "파일") +
+        " · 문단 " + (m.paragraphCount || 0) +
+        " · 표 " + (m.tableCount || 0) +
+        " · charPr " + (m.charPrCount || 0) +
+        " · paraPr " + (m.paraPrCount || 0);
+    }
+
+    function renderClusters() {
+      const list = $("cluster-list");
+      list.innerHTML = "";
+
+      state.clusters.forEach((c) => {
+        const card = document.createElement("div");
+        card.className = "cluster-card";
+        card.dataset.clusterId = c.id;
+
+        if (state.selectedClusterId === c.id) {
+          card.classList.add("selected");
+        } else if (state.selectedClusterId) {
+          card.classList.add("dim");
+        }
+
+        const head = document.createElement("div");
+        head.className = "cluster-head";
+
+        const left = document.createElement("div");
+        const roleKorean = document.createElement("span");
+        roleKorean.className = "badge";
+        roleKorean.textContent = c.roleKorean || "이름 없음";
+        const idSpan = document.createElement("span");
+        idSpan.className = "id";
+        idSpan.textContent = c.id || "";
+        left.appendChild(roleKorean);
+        left.appendChild(idSpan);
+
+        const count = document.createElement("span");
+        count.className = "count";
+        count.textContent = (c.members || []).length + "회";
+
+        head.appendChild(left);
+        head.appendChild(count);
+        card.appendChild(head);
+
+        const inputs = document.createElement("div");
+        inputs.className = "cluster-inputs";
+
+        const roleInput = document.createElement("input");
+        roleInput.type = "text";
+        roleInput.value = c.role || "";
+        roleInput.placeholder = "role";
+        roleInput.title = "role";
+        roleInput.addEventListener("input", (e) => {
+          c.role = e.target.value;
+        });
+        roleInput.addEventListener("click", (e) => e.stopPropagation());
+
+        const koInput = document.createElement("input");
+        koInput.type = "text";
+        koInput.value = c.roleKorean || "";
+        koInput.placeholder = "roleKorean";
+        koInput.title = "roleKorean";
+        koInput.addEventListener("input", (e) => {
+          c.roleKorean = e.target.value;
+        });
+        koInput.addEventListener("click", (e) => e.stopPropagation());
+
+        inputs.appendChild(roleInput);
+        inputs.appendChild(koInput);
+        card.appendChild(inputs);
+
+        const meta = buildClusterMeta(c);
+        if (meta) card.appendChild(meta);
+
+        const samples = sampleTexts(c, 2);
+        if (samples.length) {
+          const sampleBox = document.createElement("div");
+          sampleBox.className = "samples";
+          samples.forEach((t) => {
+            const div = document.createElement("div");
+            div.className = "sample";
+            div.textContent = "예: " + t;
+            sampleBox.appendChild(div);
+          });
+          card.appendChild(sampleBox);
+        }
+
+        card.addEventListener("click", () => selectCluster(c.id));
+        list.appendChild(card);
+      });
+    }
+
+    function selectCluster(id) {
+      state.selectedClusterId = state.selectedClusterId === id ? null : id;
+      renderClusters();
+      renderPreview();
+    }
+
+    function applyClusterStyle(el, clusterId) {
+      if (state.selectedClusterId) {
+        if (clusterId === state.selectedClusterId) {
+          el.classList.add("selected");
+        } else {
+          el.classList.add("dim");
+        }
+      }
+
+      if (clusterId) {
+        const color = clusterColor(clusterId);
+        const isSelected = state.selectedClusterId === clusterId;
+        el.style.background = isSelected ? color.strong : color.bg;
+      }
+    }
+
+    function renderPreview() {
+      const preview = $("preview");
+      preview.innerHTML = "";
+
+      (state.structure || []).forEach((block) => {
+        if (block.type === "paragraph") {
+          const idx = block.paraIndex;
+          const p = state.paragraphs[idx];
+          const div = document.createElement("div");
+          div.className = "para";
+          applyClusterStyle(div, state.paraToCluster[idx]);
+          div.textContent = p && p.text ? p.text : "\u00A0";
+          preview.appendChild(div);
+        } else if (block.type === "table") {
+          const table = document.createElement("table");
+
+          (block.cells || []).forEach((row) => {
+            const tr = document.createElement("tr");
+
+            (row || []).forEach((cell) => {
+              const td = document.createElement("td");
+
+              const rs = Number(cell.rowSpan);
+              const cs = Number(cell.colSpan);
+              if (Number.isFinite(rs) && rs > 1) td.rowSpan = rs;
+              if (Number.isFinite(cs) && cs > 1) td.colSpan = cs;
+
+              const idx = cell.paraIndex;
+              let text = "";
+              if (idx !== null && idx !== undefined) {
+                const p = state.paragraphs[idx];
+                text = p && p.text ? p.text : "";
+                applyClusterStyle(td, state.paraToCluster[idx]);
+              }
+
+              td.textContent = text || "\u00A0";
+              tr.appendChild(td);
+            });
+
+            table.appendChild(tr);
+          });
+
+          preview.appendChild(table);
+        }
+      });
+    }
+
+    async function analyzeFile(file) {
+      const status = $("upload-status");
+      setStatus(status, "분석 중...");
+
+      const fd = new FormData();
+      fd.append("file", file);
+
+      try {
+        const res = await fetch("/api/analyze", {
+          method: "POST",
+          body: fd
+        });
+
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          throw new Error(data.detail || ("HTTP " + res.status));
+        }
+
+        state.meta = data.meta || {};
+        state.paragraphs = data.paragraphs || [];
+        state.clusters = data.clusters || [];
+        state.structure = data.structure || [];
+        state.selectedClusterId = null;
+        state.template = null;
+        state.clusterColorIndex = {};
+
+        buildParaToCluster();
+
+        $("work-section").classList.remove("hidden");
+        $("template-output").classList.add("hidden");
+        $("downloadBtn").disabled = true;
+        $("save-status").textContent = "";
+
+        renderMeta();
+        renderClusters();
+        renderPreview();
+
+        const sourceName = data.meta && data.meta.sourceFile ? data.meta.sourceFile : file.name;
+        setStatus(status, "분석 완료: " + sourceName, "ok");
+      } catch (e) {
+        setStatus(status, "오류: " + (e.message || e), "error");
+      }
+    }
+
+    async function saveTemplate() {
+      const status = $("save-status");
+      setStatus(status, "템플릿 생성 중...");
+
+      try {
+        const payload = {
+          meta: state.meta,
+          paragraphs: state.paragraphs,
+          clusters: state.clusters,
+          structure: state.structure
+        };
+
+        const res = await fetch("/api/template", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify(payload)
+        });
+
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          throw new Error(data.detail || ("HTTP " + res.status));
+        }
+
+        state.template = data;
+        const out = $("template-output");
+        out.textContent = JSON.stringify(data, null, 2);
+        out.classList.remove("hidden");
+        $("downloadBtn").disabled = false;
+        setStatus(status, "템플릿 생성 완료", "ok");
+      } catch (e) {
+        setStatus(status, "오류: " + (e.message || e), "error");
+      }
+    }
+
+    function downloadTemplate() {
+      if (!state.template) return;
+
+      const blob = new Blob([JSON.stringify(state.template, null, 2)], {
+        type: "application/json"
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "template.json";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+
+    const dropzone = $("dropzone");
+    const fileInput = $("fileInput");
+
+    dropzone.addEventListener("click", () => fileInput.click());
+
+    fileInput.addEventListener("change", (e) => {
+      const file = e.target.files && e.target.files[0];
+      if (file) analyzeFile(file);
+      fileInput.value = "";
+    });
+
+    ["dragenter", "dragover"].forEach((ev) => {
+      dropzone.addEventListener(ev, (e) => {
+        e.preventDefault();
+        dropzone.classList.add("dragover");
+      });
+    });
+
+    ["dragleave", "drop"].forEach((ev) => {
+      dropzone.addEventListener(ev, (e) => {
+        e.preventDefault();
+        dropzone.classList.remove("dragover");
+      });
+    });
+
+    dropzone.addEventListener("drop", (e) => {
+      const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+      if (file) analyzeFile(file);
+    });
+
+    window.addEventListener("dragover", (e) => e.preventDefault());
+    window.addEventListener("drop", (e) => e.preventDefault());
+
+    $("saveBtn").addEventListener("click", saveTemplate);
+    $("downloadBtn").addEventListener("click", downloadTemplate);
+  </script>
+</body>
+</html>

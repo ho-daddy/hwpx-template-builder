@@ -1,0 +1,515 @@
+"""
+HWPX → 재사용 템플릿 변환 웹앱 (FastAPI 단일 파일)
+
+- HWPX(zip+xml)를 표준 라이브러리(zipfile, xml.etree.ElementTree)로 직접 파싱
+- (paraPrIDRef, charPrIDRef, inTable) 키로 스타일 클러스터 자동 생성
+- 휴리스틱으로 역할 이름(제목/본문/목록/표머리글 등) 제안
+- POST /api/template 에서 최종 템플릿 JSON 생성
+"""
+import io
+import re
+import zipfile
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from pathlib import Path
+
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+
+app = FastAPI(title="HWPX Template Builder")
+BASE = Path(__file__).resolve().parent
+STATIC = BASE / "static"
+
+# ---------------------------------------------------------------------------
+# 방어적 XML 헬퍼
+# ---------------------------------------------------------------------------
+
+def localname(tag):
+    """태그에서 네임스페이스를 제거한 로컬 이름.
+    (네임스페이스 URI가 파일 버전에 따라 달라질 수 있어 로컬 이름으로만 매칭)"""
+    if not isinstance(tag, str):
+        return None
+    if "}" in tag:
+        return tag.split("}", 1)[1]
+    if ":" in tag:
+        return tag.split(":", 1)[1]
+    return tag
+
+
+def attr_any(elem, names, default=None):
+    """후보 속성명 리스트를 순서대로 시도해 첫 번째로 존재하는 값을 반환.
+    (정확한 속성명이 불확실한 부분을 코드로 방어적으로 처리)"""
+    for n in names:
+        v = elem.get(n)
+        if v is not None and v != "":
+            return v
+    return default
+
+
+def child_any(elem, names):
+    """후보 자식 태그(로컬 이름) 리스트를 순서대로 시도해 첫 발견 요소를 반환.
+    (정확한 자식 태그명이 불확실한 부분을 코드로 방어적으로 처리)"""
+    for n in names:
+        for c in elem:
+            if localname(c.tag) == n:
+                return c
+    return None
+
+
+def to_pt(v, default=0.0):
+    """HWPX의 1/100pt 단위 값을 pt로 변환."""
+    try:
+        return round(int(str(v).strip()) / 100.0, 2)
+    except (TypeError, ValueError):
+        return default
+
+
+def to_int(v, default=1):
+    try:
+        return int(str(v).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+# ---------------------------------------------------------------------------
+# header.xml 파싱 (공유 스타일 정의)
+# ---------------------------------------------------------------------------
+
+def extract_char_pr(el):
+    d = {
+        "id": to_int(el.get("id"), -1),
+        "heightPt": to_pt(attr_any(el, ["height", "fontSize", "size"])),
+        "color": attr_any(el, ["textColor", "color", "foreColor"]),
+        # 볼드/이탤릭 등이 속성이자 자식 태그일 수 있어 둘 다 시도 (확실치 않아 코드로 방어적으로 처리)
+        "bold": child_any(el, ["bold"]) is not None or attr_any(el, ["bold"]) in ("1", "true"),
+        "italic": child_any(el, ["italic"]) is not None or attr_any(el, ["italic"]) in ("1", "true"),
+        "underline": child_any(el, ["underline"]) is not None,
+        "strikeout": child_any(el, ["strikeout"]) is not None,
+        "font": None,
+    }
+    fr = child_any(el, ["fontRef", "font", "fontFace"])
+    if fr is not None:
+        d["font"] = attr_any(fr, ["name", "font", "fontFamily", "faceName"])
+    if d["font"] is None:
+        d["font"] = attr_any(el, ["font", "fontFamily", "fontName"])
+    return d
+
+
+def extract_para_pr(el):
+    d = {"id": to_int(el.get("id"), -1)}
+    # 정렬/들여쓰기/줄간격이 속성이자 자식 태그일 수 있어 둘 다 시도 (확실치 않아 코드로 방어적으로 처리)
+    al = child_any(el, ["align", "alignment"])
+    d["align"] = (attr_any(al, ["value", "type", "mode"]) if al is not None else None) \
+        or attr_any(el, ["align", "alignment"], "left")
+    ind = child_any(el, ["indent", "indentation"])
+    d["indentLeftPt"] = to_pt(attr_any(ind, ["left", "leftIndent", "start"]) if ind is not None
+                              else attr_any(el, ["indentLeft", "leftIndent"]))
+    d["indentRightPt"] = to_pt(attr_any(ind, ["right", "rightIndent", "end"]) if ind is not None
+                               else attr_any(el, ["indentRight", "rightIndent"]))
+    lp = child_any(el, ["linePitch", "lineSpacing"])
+    d["linePitchPt"] = to_pt(attr_any(lp, ["value", "pitch"]) if lp is not None
+                             else attr_any(el, ["linePitch", "lineSpacing"]))
+    sb = child_any(el, ["spaceBefore"])
+    d["spaceBeforePt"] = to_pt(attr_any(sb, ["value"]) if sb is not None else attr_any(el, ["spaceBefore"]))
+    sa = child_any(el, ["spaceAfter"])
+    d["spaceAfterPt"] = to_pt(attr_any(sa, ["value"]) if sa is not None else attr_any(el, ["spaceAfter"]))
+    d["list"] = child_any(el, ["listPr", "list", "numbering", "numPr"]) is not None
+    return d
+
+
+def parse_header(zf):
+    header_name = None
+    for n in zf.namelist():
+        if n.lower().endswith("header.xml"):
+            header_name = n
+            if n.lower() == "contents/header.xml":
+                break
+    if header_name is None:
+        raise ValueError("header.xml을 찾을 수 없습니다")
+    root = ET.fromstring(zf.read(header_name))
+    char_prs, para_prs = {}, {}
+    for el in root.iter():
+        ln = localname(el.tag)
+        if ln == "charPr":
+            char_prs[to_int(el.get("id"), -1)] = extract_char_pr(el)
+        elif ln == "paraPr":
+            para_prs[to_int(el.get("id"), -1)] = extract_para_pr(el)
+    return char_prs, para_prs
+
+
+# ---------------------------------------------------------------------------
+# section*.xml 파싱 (본문: 문단/표 순회)
+# ---------------------------------------------------------------------------
+
+class Doc:
+    def __init__(self):
+        self.paragraphs = []   # 문서 순서대로 모든 문단 (표 안 문단 포함)
+        self.structure = []    # 문서 골격 (상위 문단/표 블록 순서)
+        self.tables = {}
+        self._table_seq = 0
+
+    def add_para(self, para_pr_ref, char_pr_ref, text, in_table):
+        self.paragraphs.append({
+            "index": len(self.paragraphs),
+            "text": text,
+            "paraPrIDRef": para_pr_ref,
+            "charPrIDRef": char_pr_ref,
+            "inTable": in_table,
+        })
+        return len(self.paragraphs) - 1
+
+
+def t_element_text(t_el):
+    """<hp:t> 하나의 전체 텍스트를 복원한다. HWPX는 tab처럼 텍스트 중간에 끼는
+    인라인 컨트롤을 자식 요소로 넣는데, 그 뒤에 이어지는 텍스트는 ElementTree
+    기준으로 그 자식의 .tail에 담기고 t_el.text에는 안 잡힌다 — 그래서 t_el.text만
+    읽으면 tab 뒤 내용(예: "문서번호<tab/>새움터 2025-04-02"에서 탭 뒤 값)이
+    통째로 사라짐(2026-08-30 새움터 공문양식 실사례로 발견). 자식들의 tail까지
+    순서대로 이어붙여 복원하고, tab은 실제 표시대로 "\t"로 치환한다."""
+    parts = [t_el.text or ""]
+    for child in t_el:
+        if localname(child.tag) == "tab":
+            parts.append("\t")
+        parts.append(child.tail or "")
+    return "".join(parts)
+
+
+def para_text_and_runs(p_el):
+    """문단 내 run 텍스트를 모으고 charPrIDRef별 글자 수를 세어 대표 run을 정한다.
+    HWPX는 run 자체가 아니라 run의 자식 <hp:t>에 텍스트를 담으므로 그쪽에서 읽는다.
+    p_el의 직계 run 자식만 본다(iter() 전체탐색 X) — 문단 안에 표가 중첩된 경우
+    표 셀 내부의 run까지 딸려와 문단 텍스트에 섞이는 것을 방지한다."""
+    parts, run_counts = [], {}
+    for el in p_el:
+        if localname(el.tag) != "run":
+            continue
+        t_el = child_any(el, ["t"])
+        t = t_element_text(t_el) if t_el is not None else ""
+        if not t:
+            continue
+        parts.append(t)
+        ref = attr_any(el, ["charPrIDRef", "charPrRef", "charPrId"])
+        ref = ref if ref is not None else "0"
+        run_counts[ref] = run_counts.get(ref, 0) + len(t)
+    return "".join(parts), run_counts
+
+
+def extract_table(tbl_el, doc, record=True):
+    rows = []
+    for tr in tbl_el:
+        if localname(tr.tag) != "tr":
+            continue
+        row = []
+        for tc in tr:
+            if localname(tc.tag) != "tc":
+                continue
+            # 셀 병합 속성명은 파일에 따라 다를 수 있어 후보를 순서대로 시도 (방어적 처리)
+            rs = to_int(attr_any(tc, ["rowSpan", "rowSpanCount", "vMerge", "rowSpanValue"]), 1)
+            cs = to_int(attr_any(tc, ["colSpan", "colSpanCount", "hMerge", "colSpanValue"]), 1)
+            cell_idx, best_len = None, -1
+            for el in tc.iter():
+                if localname(el.tag) != "p":
+                    continue
+                text, runs = para_text_and_runs(el)
+                dom = max(runs, key=runs.get) if runs else "0"
+                idx = doc.add_para(
+                    attr_any(el, ["paraPrIDRef", "paraPrRef", "paraPrId"]),
+                    dom, text, True,
+                )
+                # 셀 대표 문단 = 텍스트가 가장 긴 문단 (나머지 문단도 클러스터링에는 포함)
+                if len(text) > best_len:
+                    best_len, cell_idx = len(text), idx
+            row.append({"rowSpan": rs, "colSpan": cs, "paraIndex": cell_idx})
+        rows.append(row)
+    cols = max((len(r) for r in rows), default=0)
+    block = {"type": "table", "rows": len(rows), "cols": cols, "cells": rows}
+    if record:
+        block["id"] = f"t{doc._table_seq}"
+        doc.tables[block["id"]] = {"rows": len(rows), "cols": cols}
+        doc._table_seq += 1
+    return block
+
+
+def walk(el, in_table, doc):
+    for child in el:
+        ln = localname(child.tag)
+        if ln == "p":
+            text, runs = para_text_and_runs(child)
+            dom = max(runs, key=runs.get) if runs else "0"
+            idx = doc.add_para(
+                attr_any(child, ["paraPrIDRef", "paraPrRef", "paraPrId"]),
+                dom, text, in_table,
+            )
+            if not in_table:
+                doc.structure.append({"type": "paragraph", "paraIndex": idx})
+            # HWPX는 표를 문단 안 run에 중첩한다(sec>p>run>tbl) — run 자식까지 내려가 표를 찾는다.
+            for run_child in child:
+                if localname(run_child.tag) != "run":
+                    continue
+                for grandchild in run_child:
+                    if localname(grandchild.tag) == "tbl":
+                        block = extract_table(grandchild, doc, record=not in_table)
+                        if not in_table:
+                            doc.structure.append(block)
+        elif ln == "tbl":
+            block = extract_table(child, doc, record=not in_table)
+            if not in_table:
+                doc.structure.append(block)
+        else:
+            walk(child, in_table, doc)
+
+
+# ---------------------------------------------------------------------------
+# 클러스터링 + 역할 휴리스틱
+# ---------------------------------------------------------------------------
+
+ROLE_KO = {
+    "title": "제목", "subtitle": "부제목", "heading": "소제목", "body": "본문",
+    "list_item": "목록", "table_header": "표 머리글", "table_cell": "표 셀",
+    "caption": "캡션", "footnote": "주석", "text": "일반 텍스트", "other": "기타",
+}
+
+BULLET_RE = re.compile(
+    r"^\s*(?:"
+    r"[•·◦▪◢◣‣∙*+-]"
+    r"|\d+[\.、)）:]"
+    r"|\(\d+\)"
+    r"|[①②③④⑤⑥⑦⑧⑨⑩]"
+    r"|[（(]\s*\d+\s*[)）]"
+    r")\s"
+)
+
+
+def guess_role(c, doc, body_h, body_id):
+    ch = c["charPr"] or {}
+    pa = c["paraPr"] or {}
+    h = ch.get("heightPt") or 0
+    bold = bool(ch.get("bold"))
+    n = len(c["members"])
+    first = c["members"][0] if c["members"] else 0
+    texts = [doc.paragraphs[i]["text"] for i in c["members"]]
+    nonempty = [t for t in texts if t.strip()]
+    listish = bool(pa.get("list"))
+    if not listish and nonempty:
+        hits = sum(1 for t in nonempty if BULLET_RE.match(t))
+        listish = hits * 2 >= len(nonempty)
+    if c["inTable"]:
+        return "table_header" if bold else "table_cell"
+    if listish:
+        return "list_item"
+    if h and body_h:
+        if h >= body_h * 1.3 and n <= 5 and first <= 10:
+            return "title"
+        if h >= body_h * 1.15 and n <= 12:
+            return "heading"
+        if h <= body_h * 0.85:
+            return "caption" if h >= body_h * 0.7 else "footnote"
+    if bold and (pa.get("align") or "").lower() == "center":
+        return "subtitle"
+    if c["id"] == body_id:
+        return "body"
+    return "text"
+
+
+def assign_roles(clusters, doc):
+    # 본문 기준 글자크기 = 표 제외 클러스터에서 문단 수 가중 모수
+    heights = {}
+    for c in clusters:
+        if c["inTable"]:
+            continue
+        h = (c["charPr"] or {}).get("heightPt")
+        if h:
+            heights[h] = heights.get(h, 0) + len(c["members"])
+    body_h = max(heights, key=heights.get) if heights else 11.0
+
+    body_id, best = None, -1
+    for c in clusters:
+        if not c["inTable"] and len(c["members"]) > best:
+            best, body_id = len(c["members"]), c["id"]
+
+    for c in clusters:
+        base = guess_role(c, doc, body_h, body_id)
+        c["_baseRole"] = base
+        c["role"] = base
+        c["roleKorean"] = ROLE_KO.get(base, "기타")
+
+    # 이름 충돌 시 heading, heading2, heading3 ...
+    used = {}
+    for c in clusters:
+        base = c["_baseRole"]
+        if base in used:
+            used[base] += 1
+            c["role"] = f"{base}{used[base]}"
+        else:
+            used[base] = 1
+
+
+def build_clusters(doc, char_prs, para_prs):
+    # 핵심: 같은 (paraPrIDRef, charPrIDRef, inTable) 조합 = 저작자가 지정한 동일 스타일
+    groups, order = {}, []
+    for p in doc.paragraphs:
+        key = (p["paraPrIDRef"], p["charPrIDRef"], p["inTable"])
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(p["index"])
+    clusters = []
+    for ppr, cpr, in_tbl in order:
+        clusters.append({
+            "id": f"c{len(clusters)}",
+            "paraPrIDRef": ppr,
+            "charPrIDRef": cpr,
+            "inTable": in_tbl,
+            "members": groups[(ppr, cpr, in_tbl)],
+            "charPr": char_prs.get(to_int(cpr, -1)),
+            "paraPr": para_prs.get(to_int(ppr, -1)),
+        })
+    assign_roles(clusters, doc)
+    return clusters
+
+
+# ---------------------------------------------------------------------------
+# 전체 분석
+# ---------------------------------------------------------------------------
+
+def analyze_hwpx(data: bytes, filename: str):
+    zf = zipfile.ZipFile(io.BytesIO(data))
+    char_prs, para_prs = parse_header(zf)
+    doc = Doc()
+    sec_names = [n for n in zf.namelist()
+                 if re.match(r"contents/section\d+\.xml$", n, re.IGNORECASE)]
+    if not sec_names:
+        sec_names = [n for n in zf.namelist()
+                     if re.search(r"section\d*\.xml$", n, re.IGNORECASE)]
+    if not sec_names:
+        raise ValueError("section*.xml 본문 파일을 찾을 수 없습니다")
+    sec_names.sort(key=lambda n: to_int(re.search(r"section(\d+)", n, re.IGNORECASE).group(1), 0))
+    for n in sec_names:
+        root = ET.fromstring(zf.read(n))
+        body = next((el for el in root.iter() if localname(el.tag) == "body"), None)
+        walk(body if body is not None else root, False, doc)
+    clusters = build_clusters(doc, char_prs, para_prs)
+    return {
+        "meta": {
+            "sourceFile": filename,
+            "createdAt": datetime.now(timezone.utc).isoformat(),
+            "paragraphCount": len(doc.paragraphs),
+            "tableCount": len(doc.tables),
+            "charPrCount": len(char_prs),
+            "paraPrCount": len(para_prs),
+        },
+        "paragraphs": doc.paragraphs,
+        "clusters": clusters,
+        "structure": doc.structure,
+        "tables": doc.tables,
+    }
+
+
+# ---------------------------------------------------------------------------
+# API
+# ---------------------------------------------------------------------------
+
+@app.post("/api/analyze")
+async def analyze(file: UploadFile = File(...)):
+    data = await file.read()
+    name = file.filename or "upload.hwpx"
+    if data[:4] == b"\xd0\xcf\x11\xe0":
+        raise HTTPException(400, "구형 .hwp(OLE2) 파일은 이번 버전에서 지원하지 않습니다. .hwpx로 변환해 주세요.")
+    if data[:2] != b"PK":
+        raise HTTPException(400, "HWPX(ZIP) 파일이 아닙니다. .hwpx 파일을 업로드해 주세요.")
+    try:
+        return analyze_hwpx(data, name)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"HWPX 파싱 실패: {type(e).__name__}: {e}")
+
+
+@app.post("/api/template")
+def make_template(payload: dict):
+    """사용자 검토/수정 결과를 받아 최종 템플릿 JSON(hwpx-template/1.0) 생성."""
+    clusters = payload.get("clusters") or []
+    paragraphs = payload.get("paragraphs") or []
+    structure = payload.get("structure") or []
+    meta = payload.get("meta") or {}
+    pmap = {p["index"]: p for p in paragraphs}
+    para_to_cluster = {}
+    for c in clusters:
+        for i in c.get("members", []):
+            para_to_cluster[i] = c["id"]
+
+    styles = []
+    for c in clusters:
+        members = c.get("members", [])
+        samples = []
+        for i in members:
+            t = (pmap.get(i) or {}).get("text", "").strip()
+            if t and t not in samples:
+                samples.append(t[:100])
+            if len(samples) >= 3:
+                break
+        styles.append({
+            "id": c.get("id"),
+            "role": c.get("role"),
+            "roleKorean": c.get("roleKorean"),
+            "inTable": c.get("inTable"),
+            "charPr": c.get("charPr"),
+            "paraPr": c.get("paraPr"),
+            "occurrences": len(members),
+            "samples": samples,
+        })
+
+    out_structure = []
+    for block in structure:
+        btype = block.get("type")
+        if btype == "paragraph":
+            i = block.get("paraIndex")
+            out_structure.append({
+                "type": "paragraph",
+                "style": para_to_cluster.get(i),
+                "text": (pmap.get(i) or {}).get("text", ""),
+            })
+        elif btype == "table":
+            cells = []
+            for row in block.get("cells", []):
+                crow = []
+                for cell in row:
+                    i = cell.get("paraIndex")
+                    crow.append({
+                        "style": para_to_cluster.get(i) if i is not None else None,
+                        "text": (pmap.get(i) or {}).get("text", "") if i is not None else "",
+                        "rowSpan": cell.get("rowSpan", 1),
+                        "colSpan": cell.get("colSpan", 1),
+                    })
+                cells.append(crow)
+            out_structure.append({
+                "type": "table",
+                "rows": block.get("rows"),
+                "cols": block.get("cols"),
+                "cells": cells,
+            })
+
+    return {
+        "meta": {
+            **meta,
+            "schema": "hwpx-template/1.0",
+            "generator": "hwpx-template-builder/1.0",
+            "templateGeneratedAt": datetime.now(timezone.utc).isoformat(),
+        },
+        "styles": styles,
+        "structure": out_structure,
+    }
+
+
+if STATIC.is_dir():
+    app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
+
+
+@app.get("/")
+def index():
+    return FileResponse(str(STATIC / "index.html"))
+
+
+if __name__ == "__main__":
+    import uvicorn
