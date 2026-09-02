@@ -1,8 +1,10 @@
 """SQLite 기반 템플릿 저장소.
 
-이름표(label)까지 붙은 템플릿과 원본 hwpx 원본 바이트를 함께 저장해두면,
-이후 generate 단계는 이 레코드 하나만으로(원본 파일을 다시 업로드할 필요 없이)
-{라벨: 새값} 딕셔너리만 받아 새 hwpx를 생성할 수 있다.
+템플릿은 "원본과 동일한 형식(xml 포함 패키지)"으로 저장된다. build_template_package()
+가 원본 hwpx의 각 채울 자리를 라벨 placeholder로 치환한 템플릿화된 패키지(template_hwpx)
+를 만들어주므로, 여기서는 이를 원본(template_json 메타 + original_hwpx 원본 바이트)과
+함께 보관한다. 이후 generate 단계는 template_hwpx 하나만으로 {라벨: 새값}만 받아
+placeholder를 치환해 새 hwpx를 만들 수 있다.
 """
 from __future__ import annotations
 
@@ -26,21 +28,27 @@ def init_db() -> None:
             original_hwpx BLOB NOT NULL
         )
     """)
+    # 마이그레이션: template_hwpx(템플릿화된 패키지) 컬럼 추가
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(templates)").fetchall()}
+    if "template_hwpx" not in cols:
+        conn.execute("ALTER TABLE templates ADD COLUMN template_hwpx BLOB")
     conn.commit()
     conn.close()
 
 
-def save_template(name: str, source_filename: str, template: dict, original_hwpx: bytes) -> int:
+def save_template(name: str, source_filename: str, template: dict,
+                  original_hwpx: bytes, template_hwpx: bytes) -> int:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.execute(
-        "INSERT INTO templates (name, source_filename, created_at, template_json, original_hwpx) "
-        "VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO templates (name, source_filename, created_at, template_json, original_hwpx, template_hwpx) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
         (
             name,
             source_filename,
             datetime.now(timezone.utc).isoformat(),
             json.dumps(template, ensure_ascii=False),
             original_hwpx,
+            template_hwpx,
         ),
     )
     conn.commit()
@@ -63,7 +71,7 @@ def get_template(template_id: int) -> dict | None:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     row = conn.execute(
-        "SELECT id, name, source_filename, created_at, template_json, original_hwpx "
+        "SELECT id, name, source_filename, created_at, template_json, original_hwpx, template_hwpx "
         "FROM templates WHERE id = ?",
         (template_id,),
     ).fetchone()
@@ -82,3 +90,4 @@ def delete_template(template_id: int) -> bool:
     deleted = cur.rowcount > 0
     conn.close()
     return deleted
+

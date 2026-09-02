@@ -22,7 +22,7 @@ from fastapi.staticfiles import StaticFiles
 
 import ai_label
 import db
-from generate import GenerateError, generate_hwpx
+from generate import GenerateError, build_template_package, generate_hwpx
 
 app = FastAPI(title="HWPX Template Builder")
 BASE = Path(__file__).resolve().parent
@@ -266,10 +266,65 @@ def extract_table(tbl_el, doc, record=True, counter=None, section_file=None):
     return block
 
 
+def _find_embedded_tbls(p_el):
+    """문단이 run 안에 인라인으로 직접 품은 <hp:tbl>을 문서 순서대로 반환.
+    HWPX는 표를 문단 안 run에 중첩한다(sec>p>run>tbl)."""
+    found = []
+    for run in p_el:
+        if localname(run.tag) != "run":
+            continue
+        for g in run:
+            if localname(g.tag) == "tbl":
+                found.append(g)
+    return found
+
+
+def _count_direct_run_ts(p_el, counter):
+    """문단의 run이 직접 지닌 <hp:t>(그림/표가 아닌 텍스트)를 카운터로만 센다.
+    컨테이너 문단의 '표 뒤 <hp:t/> 마무리' 같은 빈 t를 raw 위치에 맞춰 세는 데 쓰인다.
+    (표 안 셀 문단은 extract_table이 이미 counter를 진행시킨다.)"""
+    for run in p_el:
+        if localname(run.tag) != "run":
+            continue
+        for g in run:
+            if localname(g.tag) == "t":
+                counter[0] += 1
+
+
+def _para_visible_text(p_el):
+    """문단이 (그림/표 같은 인라인 개체와 무관하게) 실제로 이룬 가시 텍스트.
+    빈 <hp:t/>는 가시 텍스트로 치지 않는다."""
+    parts = []
+    for run in p_el:
+        if localname(run.tag) != "run":
+            continue
+        for g in run:
+            if localname(g.tag) == "t":
+                parts.append(g.text or "")
+    return "".join(parts)
+
+
 def walk(el, in_table, doc, counter, section_file):
     for child in el:
         ln = localname(child.tag)
         if ln == "p":
+            own_tbls = _find_embedded_tbls(child)
+            if own_tbls and not in_table and not _para_visible_text(child).strip():
+                # --- 인라인 표 컨테이너 문단 처리 ---
+                # 컨테이너 문단(sec>p>run>tbl)은 fillable 본문이 아니라 표를 담는 골격
+                # 일 뿐이다. 그런데 그 run의 <hp:t/> 마무리(표 뒤)는 ElementTree가
+                # "앞"에서 세는 반면 실제 raw 문자열에서는 표 전체가 끝난 뒤 위치해,
+                # 순회 카운터를 그대로 쓰면 표 셀 index가 +1 밀린다(금속노조성명서 첫
+                # 표에서 확인). 해결: 1) 먼저 표 셀들이 (앞에 아무 것도 안 세고) raw
+                # 순서와 일치하게 index를 소비하게 한 뒤, 2) 컨테이너 자신의 표 뒤
+                # 마무리 <hp:t/>를 raw 위치에 맞게 센다. 이러면 셀은 0,1,2..., 이어지는
+                # 본문도 어긋나지 않는다.
+                for tb in own_tbls:
+                    block = extract_table(tb, doc, record=True,
+                                          counter=counter, section_file=section_file)
+                    doc.structure.append(block)
+                _count_direct_run_ts(child, counter)
+                continue
             text, runs, t_occ, has_tab = para_text_and_runs(child, counter)
             dom = max(runs, key=runs.get) if runs else "0"
             idx = doc.add_para(
@@ -279,15 +334,11 @@ def walk(el, in_table, doc, counter, section_file):
             if not in_table:
                 doc.structure.append({"type": "paragraph", "paraIndex": idx})
             # HWPX는 표를 문단 안 run에 중첩한다(sec>p>run>tbl) — run 자식까지 내려가 표를 찾는다.
-            for run_child in child:
-                if localname(run_child.tag) != "run":
-                    continue
-                for grandchild in run_child:
-                    if localname(grandchild.tag) == "tbl":
-                        block = extract_table(grandchild, doc, record=not in_table,
-                                               counter=counter, section_file=section_file)
-                        if not in_table:
-                            doc.structure.append(block)
+            for tb in own_tbls:
+                block = extract_table(tb, doc, record=not in_table,
+                                       counter=counter, section_file=section_file)
+                if not in_table:
+                    doc.structure.append(block)
         elif ln == "tbl":
             block = extract_table(child, doc, record=not in_table,
                                    counter=counter, section_file=section_file)
@@ -574,16 +625,30 @@ async def create_template(
     template: str = Form(...),
     file: UploadFile = File(...),
 ):
-    """라벨 붙은 template(JSON 문자열) + 원본 hwpx 파일을 함께 저장한다.
-    원본 바이트가 있어야 나중에 generate가 라벨 없는 자리는 그대로 두고
-    라벨 있는 자리만 정확히 치환할 수 있다."""
+    """라벨 붙은 template(JSON) + 원본 hwpx 파일을 받아 저장한다.
+
+    핵심: 원본을 그대로 두지 않고, 각 라벨 자리를 placeholder로 치환한 "템플릿화된
+    패키지"(build_template_package)를 만들어 함께 저장한다. 따라서 템플릿은 "원본과
+    동일한 형식(xml 포함 패키지)"이며, generate 단계는 이 패키지에서 placeholder를
+    값으로 교체만 하면 된다. 원본 바이트(original_hwpx)도 보존해 placeholder에 담기
+    어려운 자리(복수 run 등) 복원에 대비한다."""
     import json as _json
     try:
         template_obj = _json.loads(template)
     except _json.JSONDecodeError as e:
         raise HTTPException(400, f"template이 올바른 JSON이 아닙니다: {e}")
     data = await file.read()
-    template_id = db.save_template(name, file.filename or "", template_obj, data)
+
+    # 원본 패키지에서 라벨 자리만 placeholder로 치환한 "템플릿화된 패키지" 생성.
+    # 템플릿 자체가 원본과 같은 형식의 hwpx 패키지가 된다.
+    try:
+        template_hwpx = build_template_package(data, template_obj)
+    except Exception as e:
+        raise HTTPException(500, f"템플릿 패키지 생성 실패: {type(e).__name__}: {e}")
+
+    template_id = db.save_template(
+        name, file.filename or "", template_obj, data, template_hwpx
+    )
     return {"id": template_id, "name": name}
 
 
@@ -597,7 +662,10 @@ def get_template(template_id: int):
     row = db.get_template(template_id)
     if row is None:
         raise HTTPException(404, "템플릿을 찾을 수 없습니다")
+    # BLOB 두 컬럼(원본/템플릿화된 패키지)은 큰 바이너리라 JSON 응답에서 제외한다.
+    # 프론트는 여기서 template 메타/구조만 필요하지 바이너리 패키지는 쓰지 않는다.
     row.pop("original_hwpx", None)
+    row.pop("template_hwpx", None)
     return row
 
 
@@ -610,13 +678,29 @@ def remove_template(template_id: int):
 
 @app.post("/api/templates/{template_id}/generate")
 def generate_from_template(template_id: int, payload: dict):
-    """payload: {"values": {"라벨": "새 텍스트", ...}} → 새 hwpx 파일 응답."""
+    """payload: {"values": {"라벨": "새 텍스트", ...}} → 새 hwpx 파일 응답.
+
+    저장된 템플릿은 이미 "원본과 동일한 형식(xml 포함 패키지)"이고 각 라벨 자리가
+    placeholder로 치환되어 있으므로, generate는 그 placeholder를 값으로만 교체한다.
+    """
     row = db.get_template(template_id)
     if row is None:
         raise HTTPException(404, "템플릿을 찾을 수 없습니다")
     values = payload.get("values") or {}
+
+        # 반드시 원본 preserved 패키지(original_hwpx)를 기준으로 생성한다.
+    # template_hwpx(placeholder가 박힌 패키지)는 저장/다운로드용 산출물일 뿐,
+    # placeholder를 박는 순간 문단이 짧아지며 그 <hp:lineseg>(줄바꿈 캐시)가 잘리고,
+    # 손상된 파일에 원본과 같은 값으로 다시 메워도 잘린 캐시가 복구되지 않아
+    # 표 셀 순서 밀림/텍스트 겹침이 생긴다. generate_hwpx는 원본 위에서 slot을
+    # 찾아 치환하며, 값이 이미 원본과 같으면(동일 내용 재생성) 해당 문단을 아예
+    # 건드리지 않는다 → 산출물이 원본과 똑같아진다.
+    template_bytes = row.get("original_hwpx")
+    if not template_bytes:
+        raise HTTPException(500, "저장된 원본 패키지가 없습니다")
+
     try:
-        out_bytes = generate_hwpx(row["original_hwpx"], row["template"], values)
+        out_bytes = generate_hwpx(template_bytes, row["template"], values)
     except GenerateError as e:
         raise HTTPException(400, str(e))
     except Exception as e:
