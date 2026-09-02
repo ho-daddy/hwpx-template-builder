@@ -308,10 +308,46 @@
       padding: 12px;
       max-height: 52vh;
       overflow: auto;
-      font-size: 12px;
+            font-size: 12px;
       line-height: 1.5;
       color: #111827;
     }
+
+    /* ================= 문서 생성 UI (추가) ================= */
+    button.danger { background: #dc2626; }
+    button.danger:hover { background: #b91c1c; }
+    button.secondary { background: #64748b; }
+    button.secondary:hover { background: #475569; }
+
+    .tpl-list { display: flex; flex-direction: column; gap: 8px; }
+    .tpl-item {
+      border: 1px solid #e5e7eb; border-radius: 8px; padding: 10px 12px; cursor: pointer;
+      background: #ffffff; display: flex; justify-content: space-between; align-items: center; gap: 8px;
+    }
+    .tpl-item:hover { border-color: #c7d2fe; }
+    .tpl-item.selected { border-color: #6366f1; box-shadow: 0 0 0 2px rgba(99,102,241,.18); }
+    .tpl-name { font-weight: 600; font-size: 14px; }
+    .tpl-meta { font-size: 12px; color: #6b7280; margin-top: 3px; }
+    .tpl-actions { display: flex; gap: 6px; align-items: center; }
+    .tpl-actions button { padding: 6px 10px; font-size: 12px; }
+
+    .slot-card { border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px; margin-bottom: 12px; background: #ffffff; }
+    .slot-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; flex-wrap: wrap; gap: 4px; }
+    .slot-label { font-weight: 600; font-size: 14px; }
+    .slot-role { font-size: 12px; color: #6b7280; }
+    .slot-original { font-size: 12px; color: #9ca3af; margin-bottom: 8px; word-break: break-all; font-style: italic; }
+    .slot-card textarea {
+      width: 100%; border: 1px solid #d1d5db; border-radius: 6px; padding: 8px; font-size: 13px;
+      color: #111827; background: #ffffff; font-family: inherit; resize: vertical; min-height: 60px;
+    }
+    .slot-card textarea:focus { outline: none; border-color: #6366f1; box-shadow: 0 0 0 2px rgba(99,102,241,.15); }
+    .slot-file-row { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
+    .slot-file-row input[type="file"] { display: none; }
+    .file-btn { padding: 6px 10px; font-size: 12px; background: #eef2ff; color: #4338ca; border: 1px solid #c7d2fe; border-radius: 6px; cursor: pointer; }
+    .file-btn:hover { background: #e0e7ff; }
+    .file-name { font-size: 12px; color: #6b7280; }
+    .gen-split { display: grid; grid-template-columns: 380px 1fr; gap: 16px; align-items: start; }
+    @media (max-width: 980px) { .gen-split { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
@@ -352,22 +388,55 @@
           <button id="saveBtn" type="button">템플릿 확정 및 생성</button>
           <button id="downloadBtn" type="button" disabled>템플릿.json 다운로드</button>
         </div>
-        <div id="save-status" class="status"></div>
+                <div id="save-status" class="status"></div>
         <pre id="template-output" class="hidden"></pre>
       </section>
+    </section>
+
+    <!-- ================= 5. 문서 생성 ================= -->
+    <section class="card" style="margin-top:16px;">
+      <h2>5. 저장된 템플릿으로 새 문서 생성</h2>
+      <div class="gen-split">
+        <div>
+          <h3 style="font-size:14px;color:#1f2937;margin:0 0 8px;">템플릿 선택</h3>
+          <div class="actions">
+            <button id="refreshBtn" type="button" class="secondary">목록 새로고침</button>
+          </div>
+          <div id="tpl-list" class="tpl-list"></div>
+          <div id="tpl-status" class="status"></div>
+        </div>
+        <div>
+          <h3 style="font-size:14px;color:#1f2937;margin:0 0 8px;">내용 입력</h3>
+          <div id="slot-form-wrap">
+            <p style="color:#6b7280;font-size:13px;">왼쪽에서 템플릿을 선택하면 채울 자리가 표시됩니다.<br>각 자리에 텍스트를 직접 입력하거나 파일로 채울 수 있습니다.</p>
+          </div>
+          <div id="generate-controls" class="hidden" style="margin-top:14px;padding-top:14px;border-top:1px solid #e5e7eb;">
+            <div class="actions">
+              <button id="generateBtn" type="button">.hwpx 생성</button>
+            </div>
+            <div id="generate-status" class="status"></div>
+          </div>
+        </div>
+      </div>
     </section>
   </main>
 
   <script>
-    const state = {
+        const state = {
       meta: null,
       paragraphs: [],
       clusters: [],
       structure: [],
       selectedClusterId: null,
       template: null,
+      originalFile: null,   // 업로드한 원본 hwpx File 객체 (저장 시 재전송에 사용)
       paraToCluster: {},
-      clusterColorIndex: {}
+      clusterColorIndex: {},
+      // 문서 생성
+      templates: [],          // 저장된 템플릿 목록
+      selectedTemplate: null, // 선택한 템플릿 상세(template 포함)
+      slots: [],              // 선택한 템플릿의 채울 슬롯
+      slotValues: {}          // slot key -> 입력값
     };
 
     const $ = (id) => document.getElementById(id);
@@ -599,9 +668,10 @@
       });
     }
 
-    async function analyzeFile(file) {
+        async function analyzeFile(file) {
       const status = $("upload-status");
       setStatus(status, "분석 중...");
+      state.originalFile = file;
 
       const fd = new FormData();
       fd.append("file", file);
@@ -643,9 +713,46 @@
       }
     }
 
+        // 템플릿 structure 안에서 채울 수 있는 슬롯을 순회하며 라벨을 보장한다.
+    // generate.py 는 라벨(label)을 키로 값을 매칭하므로, 라벨이 없는 슬롯은
+    // 자동으로 고유 라벨(예: "문단1", "표1셀2")을 부여해 어떤 환경에서도
+    // 문서 생성이 되도록 한다. 라벨이 이미 있으면 그대로 둔다(중복 시 번호).
+        function ensureSlotLabels(tpl) {
+      const used = {};
+      const asNum = (v) => (typeof v === "number" ? v : parseInt(v, 10) || 0);
+      const baseName = (kind, bi, ri, ci) =>
+        kind === "cell" ? ("표" + (asNum(bi) + 1) + "셀" + (ri * (tpl.structure[bi]?.cols || 1) + ci + 1))
+                        : ("문단" + (asNum(bi) + 1));
+      function uniq(prefix) {
+        let key = prefix;
+        let n = used[prefix] || 0;
+        if (n > 0) key = prefix + (n + 1);
+        used[prefix] = n + 1;
+        return key;
+      }
+      (tpl.structure || []).forEach((block, bi) => {
+        if (block.type === "paragraph") {
+          const label = block.label || uniq(baseName("paragraph", bi));
+          block.label = label;
+        } else if (block.type === "table") {
+          (block.cells || []).forEach((row, ri) => {
+            (row || []).forEach((cell, ci) => {
+              const label = cell.label || uniq(baseName("cell", bi, ri, ci));
+              cell.label = label;
+            });
+          });
+        }
+      });
+      return tpl;
+    }
+
     async function saveTemplate() {
       const status = $("save-status");
       setStatus(status, "템플릿 생성 중...");
+      if (!state.originalFile) {
+        setStatus(status, "오류: 원본 파일이 필요합니다. 파일을 다시 업로드하세요.", "error");
+        return;
+      }
 
       try {
         const payload = {
@@ -657,9 +764,7 @@
 
         const res = await fetch("/api/template", {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json"
-          },
+          headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload)
         });
 
@@ -667,13 +772,55 @@
         if (!res.ok) {
           throw new Error(data.detail || ("HTTP " + res.status));
         }
+        let template = data;
 
-        state.template = data;
+        // AI 라벨링 시도 (성공하면 각 자리에 의미있는 한글 라벨이 붙는다)
+        setStatus(status, "AI 라벨링 시도 중...");
+        try {
+          const lres = await fetch("/api/label", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ structure: template.structure, provider: "qwen" })
+          });
+          if (lres.ok) {
+            const ldata = await lres.json();
+            template.structure = ldata.structure || template.structure;
+            setStatus(status, "AI 라벨링 완료.");
+          } else {
+            setStatus(status, "AI 라벨링 실패 → 자동 라벨로 진행합니다.", "ok");
+          }
+        } catch (e) {
+          setStatus(status, "AI 라벨링 실패 → 자동 라벨로 진행합니다.", "ok");
+        }
+
+        // 라벨이 없는 슬롯에 자동 라벨 보장
+        ensureSlotLabels(template);
+
+        // 원본 파일명에서 템플릿 이름 기본값 생성
+        const defaultName = (state.meta.sourceFile || "템플릿").replace(/\.hwpx$/i, "");
+        const name = prompt("템플릿 이름을 입력하세요:", defaultName) || defaultName;
+        if (!name.trim()) { setStatus(status, "저장 취소됨.", ""); return; }
+
+        // DB 저장 (원본 hwpx 재전송)
+        const fd = new FormData();
+        fd.append("name", name.trim());
+        fd.append("template", JSON.stringify(template));
+        fd.append("file", state.originalFile);
+        const sres = await fetch("/api/templates", { method: "POST", body: fd });
+        const sdata = await sres.json().catch(() => ({}));
+        if (!sres.ok) {
+          throw new Error(sdata.detail || ("HTTP " + sres.status));
+        }
+
+        state.template = template;
         const out = $("template-output");
-        out.textContent = JSON.stringify(data, null, 2);
+        out.textContent = JSON.stringify(template, null, 2);
         out.classList.remove("hidden");
         $("downloadBtn").disabled = false;
-        setStatus(status, "템플릿 생성 완료", "ok");
+        setStatus(status, "템플릿 생성 & 저장 완료 (ID: " + sdata.id + ", 이름: " + name + ")", "ok");
+
+        // 문서 생성 목록에 바로 반영
+        try { await loadTemplates(); } catch (e) {}
       } catch (e) {
         setStatus(status, "오류: " + (e.message || e), "error");
       }
@@ -728,8 +875,275 @@
     window.addEventListener("dragover", (e) => e.preventDefault());
     window.addEventListener("drop", (e) => e.preventDefault());
 
-    $("saveBtn").addEventListener("click", saveTemplate);
+        $("saveBtn").addEventListener("click", saveTemplate);
     $("downloadBtn").addEventListener("click", downloadTemplate);
+
+    /* ===================== 문서 생성 ===================== */
+
+    // 저장된 템플릿 목록 로드
+    async function loadTemplates() {
+      const status = $("tpl-status");
+      setStatus(status, "목록 불러오는 중...");
+      try {
+        const res = await fetch("/api/templates");
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          throw new Error(data.detail || ("HTTP " + res.status));
+        }
+        state.templates = data || [];
+        renderTemplateList();
+        setStatus(status, "저장된 템플릿 " + state.templates.length + "개", "ok");
+      } catch (e) {
+        setStatus(status, "오류: " + (e.message || e), "error");
+      }
+    }
+
+    function renderTemplateList() {
+      const list = $("tpl-list");
+      list.innerHTML = "";
+      if (!state.templates.length) {
+        list.innerHTML = '<p style="color:#6b7280;font-size:13px;">저장된 템플릿이 없습니다.<br>"4. 템플릿 저장"에서 저장하면 여기에 나타납니다.</p>';
+        return;
+      }
+      state.templates.forEach((t) => {
+        const item = document.createElement("div");
+        item.className = "tpl-item";
+        if (state.selectedTemplate && state.selectedTemplate.id === t.id) {
+          item.classList.add("selected");
+        }
+
+        const info = document.createElement("div");
+        const name = document.createElement("div");
+        name.className = "tpl-name";
+        name.textContent = t.name || ("템플릿 " + t.id);
+        const meta = document.createElement("div");
+        meta.className = "tpl-meta";
+        meta.textContent = "#" + t.id + " · " + (t.source_filename || "") + " · " + (t.created_at || "").slice(0, 10);
+        info.appendChild(name);
+        info.appendChild(meta);
+
+        const tools = document.createElement("div");
+        tools.className = "tpl-actions";
+        const delBtn = document.createElement("button");
+        delBtn.classList.add("danger");
+        delBtn.textContent = "삭제";
+        delBtn.addEventListener("click", async (e) => {
+          e.stopPropagation();
+          if (!confirm("템플릿 '" + (t.name || t.id) + "'을(를) 삭제할까요?")) return;
+          try {
+            const res = await fetch("/api/templates/" + t.id, { method: "DELETE" });
+            if (!res.ok) throw new Error("HTTP " + res.status);
+            if (state.selectedTemplate && state.selectedTemplate.id === t.id) {
+              state.selectedTemplate = null;
+              renderSlots([]);
+              $("generate-controls").classList.add("hidden");
+            }
+            loadTemplates();
+          } catch (err) {
+            setStatus($("tpl-status"), "삭제 오류: " + err.message, "error");
+          }
+        });
+        tools.appendChild(delBtn);
+
+        item.appendChild(info);
+        item.appendChild(tools);
+        item.addEventListener("click", () => selectTemplate(t.id));
+        list.appendChild(item);
+      });
+    }
+
+    async function selectTemplate(id) {
+      setStatus($("tpl-status"), "불러오는 중...");
+      try {
+        const res = await fetch("/api/templates/" + id);
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          throw new Error(data.detail || ("HTTP " + res.status));
+        }
+        state.selectedTemplate = data;
+        buildSlots(data.template);
+        renderSlots(state.slots);
+        $("generate-controls").classList.remove("hidden");
+        renderTemplateList(); // 선택 표시 갱신
+        setStatus($("tpl-status"), "", "");
+      } catch (e) {
+        setStatus($("tpl-status"), "오류: " + (e.message || e), "error");
+      }
+    }
+
+    // 템플릿 구조에서 채울 수 있는 슬롯 추출.
+    // generate.py 의 _iter_slots 와 동일 규칙(문단 + 표 셀, tOccurrence 가 있는 것만).
+    // 각 슬롯의 라벨(label)이 generate 요청의 values 키가 된다.
+    function buildSlots(template) {
+      const slots = [];
+      const structure = (template && template.structure) || [];
+
+      structure.forEach((block, bi) => {
+        if (block.type === "paragraph") {
+          if (block.tOccurrence !== undefined && block.tOccurrence !== null) {
+            slots.push({
+              key: block.label,
+              label: block.label || "",
+              role: block.style || "",
+              text: block.text || ""
+            });
+          }
+        } else if (block.type === "table") {
+          (block.cells || []).forEach((row, ri) => {
+            (row || []).forEach((cell, ci) => {
+              if (cell.tOccurrence !== undefined && cell.tOccurrence !== null) {
+                slots.push({
+                  key: cell.label,
+                  label: cell.label || "",
+                  role: cell.style || "",
+                  text: cell.text || ""
+                });
+              }
+            });
+          });
+        }
+      });
+
+      state.slots = slots;
+      state.slotValues = {};
+      slots.forEach((s) => {
+        if (!s.key) s.key = "슬롯" + (state.slots.indexOf(s) + 1);
+        state.slotValues[s.key] = s.text;
+      });
+    }
+
+    function renderSlots(slots) {
+      const wrap = $("slot-form-wrap");
+      wrap.innerHTML = "";
+      if (!slots.length) {
+        wrap.innerHTML = '<p style="color:#6b7280;font-size:13px;">이 템플릿에는 채울 수 있는 자리가 없습니다.</p>';
+        return;
+      }
+      slots.forEach((s) => {
+        const card = document.createElement("div");
+        card.className = "slot-card";
+
+        const head = document.createElement("div");
+        head.className = "slot-head";
+        const label = document.createElement("span");
+        label.className = "slot-label";
+        label.textContent = s.label || s.key;
+        const role = document.createElement("span");
+        role.className = "slot-role";
+        role.textContent = s.role || "";
+        head.appendChild(label);
+        head.appendChild(role);
+        card.appendChild(head);
+
+        if (s.text) {
+          const orig = document.createElement("div");
+          orig.className = "slot-original";
+          orig.textContent = "원본: " + s.text;
+          card.appendChild(orig);
+        }
+
+        const ta = document.createElement("textarea");
+        ta.placeholder = "이 자리에 들어갈 내용을 입력하세요.";
+        ta.value = state.slotValues[s.key] || "";
+        ta.addEventListener("input", (e) => { state.slotValues[s.key] = e.target.value; });
+        card.appendChild(ta);
+
+        // 파일 업로드로 채우기
+        const fileRow = document.createElement("div");
+        fileRow.className = "slot-file-row";
+        const fileInput = document.createElement("input");
+        fileInput.type = "file";
+        fileInput.accept = ".txt,.md,.csv,.json";
+        const fileBtn = document.createElement("button");
+        fileBtn.type = "button";
+        fileBtn.className = "file-btn";
+        fileBtn.textContent = "파일로 채우기";
+        fileBtn.addEventListener("click", () => fileInput.click());
+        fileInput.addEventListener("change", (e) => {
+          const f = e.target.files && e.target.files[0];
+          if (!f) return;
+          const reader = new FileReader();
+          reader.onload = () => {
+            ta.value = String(reader.result || "");
+            state.slotValues[s.key] = ta.value;
+          };
+          reader.readAsText(f, "utf-8");
+          fileInput.value = "";
+        });
+        const fileName = document.createElement("span");
+        fileName.className = "file-name";
+        fileRow.appendChild(fileBtn);
+        fileRow.appendChild(fileInput);
+        fileRow.appendChild(fileName);
+        card.appendChild(fileRow);
+
+        wrap.appendChild(card);
+      });
+    }
+
+    async function generateHwpx() {
+      const status = $("generate-status");
+      if (!state.selectedTemplate) {
+        setStatus(status, "템플릿을 먼저 선택하세요.", "error");
+        return;
+      }
+            const values = {};
+      state.slots.forEach((s) => {
+        const v = state.slotValues[s.key];
+        // 빈 값이면 보내지 않음 → generate.py가 그 자리는 원본 그대로 유지
+        if (v && String(v).length > 0) {
+          values[s.key] = String(v);
+        }
+      });
+      // 아무 값도 없으면 안내
+      if (!Object.keys(values).length) {
+        setStatus(status, "채울 내용을 하나 이상 입력하세요.", "error");
+        return;
+      }
+
+      setStatus(status, "문서를 생성하는 중...");
+      try {
+        const res = await fetch("/api/templates/" + state.selectedTemplate.id + "/generate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ values: values })
+        });
+        if (!res.ok) {
+          let msg = "HTTP " + res.status;
+          try {
+            const err = await res.json();
+            msg = err.detail || msg;
+          } catch (_) {}
+          throw new Error(msg);
+        }
+        const blob = await res.blob();
+        // 다운로드 파일명(C-D 헤더의 filename*= 부분 파싱)
+        let filename = state.selectedTemplate.name + ".hwpx";
+        const cd = res.headers.get("Content-Disposition") || "";
+        const m = cd.match(/filename\*=UTF-8''([^;]+)/i);
+        if (m) {
+          try { filename = decodeURIComponent(m[1]); } catch (_) {}
+        } else {
+          const m2 = cd.match(/filename="([^"]+)"/i);
+          if (m2) filename = m2[1];
+        }
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+        setStatus(status, "문서 생성 완료: " + filename, "ok");
+      } catch (e) {
+        setStatus(status, "오류: " + (e.message || e), "error");
+      }
+    }
+
+    $("refreshBtn").addEventListener("click", loadTemplates);
+    $("generateBtn").addEventListener("click", generateHwpx);
+    loadTemplates(); // 페이지 로드 시 저장된 템플릿 목록 표시
   </script>
 </body>
 </html>
